@@ -15,7 +15,7 @@
 
 const { Plugin, ItemView, TFile, Notice, PluginSettingTab, Setting } = require('obsidian');
 
-const VIEW_TYPE = 'vault-galaxy-view';
+const VIEW_TYPE = 'vault-galaxy-folders-view';
 const GOLDEN = 2.399963229728653; // golden angle, for collision-free phase spacing
 
 // fixed tiers; folder groups get palette colors (overridable in the view panel)
@@ -24,6 +24,7 @@ const TIERS = {
   hub:     { color: '#ff9d2e', label: 'hub' },
   other:   { color: '#93a4b8', label: 'misc' },
   archive: { color: '#5c6470', label: 'archive' },
+  folder:  { color: '#e8d9a8', label: 'folders' },
 };
 const GROUP_PALETTE = [
   '#9fc7a5', '#b18cff', '#5fdd8f', '#59c2f0', '#e88bc4', '#43d9c0',
@@ -32,7 +33,7 @@ const GROUP_PALETTE = [
 const MAX_GROUPS = 12;
 
 // Kepler-ish speed constants per tier: omega = K / r^1.5  (rad/s at speed 1x)
-const SPEED_K = { core: 46, hub: 210, leaf: 64, anchor: 260, archive: 200, disc: 335 };
+const SPEED_K = { core: 46, hub: 210, leaf: 64, anchor: 260, archive: 200, disc: 335, folder: 200 };
 
 // planets view, multi-source lighting: every sun and hub is a light source.
 // Directionality = |weighted direction sum| / weight sum (1 = one source
@@ -56,7 +57,7 @@ const PHYS = {
   K_LINK: 7,    // per-link coupling spring (scaled by link weight)
   F_CAP: 1500,  // per-node force clamp (stability guard, not a tuning knob)
   V_CAP: 900,   // velocity clamp — also the max throw speed
-  MASS: { sun: 10, hub: 3.5, note: 1, archive: 0.8 },
+  MASS: { sun: 10, coreFolder: 8, hubFolder: 4, hub: 3.5, folder: 4, note: 1, archive: 0.8 },
 };
 
 // galaxy-mode disc: unlinked notes seeded along spiral arms that shear
@@ -72,7 +73,7 @@ const DISC_SPAN = 560;
 const TILT = {
   ANGLES: { flat: 0, tilt: 38 * (Math.PI / 180), steep: 62 * (Math.PI / 180) },
   FOCAL: 2400,          // perspective distance in world units (mild foreshortening)
-  Z_BAND: { sun: 6, hub: 14, note: 38, archive: 46 }, // per-tier |z| half-band
+  Z_BAND: { sun: 6, coreFolder: 8, hubFolder: 14, hub: 14, folder: 18, note: 38, archive: 46 }, // per-tier |z| half-band
   SPIN_RATE: 0.02,      // idle drift speed, rad/s (~5 min per turn)
   SPIN_IDLE_MS: 4000,   // hands-off delay before the drift resumes
 };
@@ -84,6 +85,26 @@ const DEFAULT_SETTINGS = {
   archiveFolders: '', // one folder per line — rendered as dim rim debris
   folderGroups: '',   // one folder per line for colored clusters; empty = top-level folders
   // --- view
+  showFolders: true,  // folders as nodes (linked to their notes and parent folder)
+  folderSize: 1,      // folder node size multiplier (on top of node size)
+  folderRing: true,   // outer ring around folder nodes
+  folderLabels: true, // show folder names
+  folderLabelSize: 11, // folder name font size (px)
+  folderLineWidth: 1,  // folder tree line thickness multiplier
+  folderLineAlpha: 1,  // folder tree line brightness multiplier
+  folderLineColor: '', // folder tree line color; empty = same as the folder color
+  folderSpread: 1,     // distance of folders from the center / their parents (rebuilds)
+  autoCoreCount: 5,    // how many most-linked notes become suns when no core rule matches (0 = none)
+  autoHubCount: 8,     // how many next most-linked notes become hubs when no hub rule matches (0 = none)
+  excludeRules: '',    // notes (globs) that are never auto-promoted to core/hub
+  folderAsHub: false,  // subfolders (depth 2+) drawn as hub notes
+  folderColors: {},    // per-folder color: { 'Projects': '#hex', 'Projects/Alpha': '#hex' } (inherited by subfolders and notes)
+  coreLayout: 'orbit', // 'orbit' | 'center' (biggest core in the middle) | 'fixed' (centered, others don't orbit)
+  coreBrightness: 1,   // brightness of core nodes (glow, corona, body)
+  coreCenterColor: '#fff7d8', // color of the hot center of core nodes
+  folderLabelZoom: 0,  // folder-name label threshold (0 = same as the general label threshold)
+  folderAsCore: false, // folders drawn as suns (core notes): gold, big, with corona; they light the planets
+  folderCoreLevel: 'top', // 'top' = only top-level folders | 'all' = every folder
   mode: 'galaxy',     // 'galaxy' | 'expand'
   tilt: 'steep',      // camera pitch: 'flat' (2D) | 'tilt' | 'steep'
   idleSpin: true,     // tilted views only: slow auto-drift after a few idle seconds
@@ -137,6 +158,35 @@ function tint(color, f) { // f > 0 mixes a #rrggbb toward white, f < 0 toward bl
   return `rgb(${ch((n >> 16) & 255)},${ch((n >> 8) & 255)},${ch(n & 255)})`;
 }
 
+// per-folder color: nearest ancestor-or-self override wins (inherited by subfolders and notes)
+function folderOverride(settings, path) {
+  const fc = settings.folderColors;
+  if (!fc) return null;
+  let d = path;
+  while (d) {
+    if (fc[d]) return fc[d];
+    const i = d.lastIndexOf('/');
+    d = i < 0 ? '' : d.slice(0, i);
+  }
+  return null;
+}
+
+// every folder that holds markdown notes (or holds folders that do), in tree order
+function listVaultFolders(app) {
+  const set = new Set();
+  for (const f of app.vault.getMarkdownFiles()) {
+    let d = f.path.lastIndexOf('/') < 0 ? '' : f.path.slice(0, f.path.lastIndexOf('/'));
+    while (d && !set.has(d)) { set.add(d); const i = d.lastIndexOf('/'); d = i < 0 ? '' : d.slice(0, i); }
+  }
+  return [...set].sort((a, b) => {
+    const A = a.split('/'), B = b.split('/');
+    for (let i = 0; i < Math.min(A.length, B.length); i++) {
+      if (A[i] !== B[i]) return A[i].localeCompare(B[i]);
+    }
+    return A.length - B.length;
+  });
+}
+
 function prettify(path) {
   let n = path.split('/').pop().replace(/\.md$/, '');
   n = n.replace(/^core_/, '').replace(/^hub_/, '').replace(/[_-]+/g, ' ');
@@ -170,6 +220,7 @@ function buildModel(app, settings) {
     }
     nodes.set(f.path, {
       path: f.path, tier, label: prettify(f.path), seed: hash32(f.path),
+      dir: f.path.lastIndexOf('/') < 0 ? '' : f.path.slice(0, f.path.lastIndexOf('/')),
       bytes: (f.stat && f.stat.size) || 0,
       wdeg: 0, adj: new Map(), // path -> weight
       parent: null, children: [],
@@ -235,30 +286,114 @@ function buildModel(app, settings) {
     n.theta = phase; // advanced incrementally each frame
   };
 
+  // --- folder nodes (optional): one node per folder holding notes, nested like
+  //     the folder tree. Created BEFORE the core is chosen so a core folder can
+  //     take the center; placed further below.
+  const showFolders = settings.showFolders !== false;
+  const folderNodes = new Map(); // folder path -> node
+  const folderOf = (path) => { const i = path.lastIndexOf('/'); return i < 0 ? '' : path.slice(0, i); };
+  if (showFolders) {
+    for (const f of files) {
+      if (isArchive(f.path)) continue;
+      let d = folderOf(f.path);
+      while (d && !folderNodes.has(d)) {
+        const base = d.split('/').pop();
+        const fnode = {
+          path: ' folder:' + d, folderPath: d, isFolder: true, tier: 'folder',
+          label: base.length > 30 ? base.slice(0, 29) + '…' : base,
+          seed: hash32('folder' + d), bytes: 0, wdeg: 0, adj: new Map(),
+          parent: null, children: [],
+          orbitR: 0, omega: 0, phase: 0, theta: 0, x: 0, y: 0, drawR: 5,
+          z0: 0, pf: 1, depth: 0,
+          ox: 0, oy: 0, vx: 0, vy: 0, nx: 0, ny: 0, fx: 0, fy: 0, isAnchor: false,
+        };
+        folderNodes.set(d, fnode);
+        nodes.set(fnode.path, fnode);
+        d = folderOf(d);
+      }
+    }
+    // descendant note count drives folder size
+    for (const f of files) {
+      if (isArchive(f.path)) continue;
+      let d = folderOf(f.path);
+      while (d) { folderNodes.get(d).bytes++; d = folderOf(d); }
+    }
+    for (const fn of folderNodes.values()) {
+      const topLevel = folderOf(fn.folderPath) === '';
+      fn.coreFolder = !!settings.folderAsCore && (settings.folderCoreLevel === 'all' || topLevel);
+      fn.hubFolder = !fn.coreFolder && !!settings.folderAsHub && !topLevel; // subfolders as hub notes
+    }
+  }
+  // top-level core folders, biggest first: candidates for the center / the sun rings
+  const topFolderCores = [...folderNodes.values()]
+    .filter((f) => f.coreFolder && folderOf(f.folderPath) === '')
+    .sort((a, b) => b.bytes - a.bytes || (a.folderPath < b.folderPath ? -1 : 1));
+
   // --- suns: rule-matched core notes, else auto-detect the most-linked notes
-  const ranked = [...nodes.values()].filter((n) => !n.isAnchor && n.tier !== 'archive')
+  //     (how many is a setting; 0 = none, and notes matching the exclusion
+  //     patterns are never auto-promoted)
+  const isExcluded = compileGlobs(settings.excludeRules);
+  const ranked = [...nodes.values()].filter((n) => !n.isAnchor && !n.isFolder && n.tier !== 'archive')
     .sort((a, b) => b.wdeg - a.wdeg);
+  const rankedAuto = ranked.filter((n) => !isExcluded(n.path));
+  const autoCore = Math.max(0, Math.min(10, Math.round(settings.autoCoreCount === undefined ? 5 : settings.autoCoreCount)));
+  const autoHub = Math.max(0, Math.min(20, Math.round(settings.autoHubCount === undefined ? 8 : settings.autoHubCount)));
   let suns = ranked.filter((n) => n.tier === 'core');
-  if (suns.length === 0) {
-    suns = ranked.slice(0, 5).filter((n) => n.wdeg > 0);
-    if (suns.length === 0) suns = ranked.slice(0, 1); // empty-link vault: one lonely star
+  if (suns.length === 0 && autoCore > 0) {
+    suns = rankedAuto.slice(0, autoCore).filter((n) => n.wdeg > 0);
+    if (suns.length === 0) suns = rankedAuto.slice(0, 1); // empty-link vault: one lonely star
     suns.forEach((n) => { n.tier = 'core'; });
   }
-  suns.sort((a, b) => b.wdeg - a.wdeg);
-  const central = suns[0];
-  central.parent = null; central.orbitR = 0; central.omega = 0;
-  for (let i = 1; i < suns.length; i++) {
-    const ring = Math.floor((i - 1) / 4);
-    const r = 115 + ring * 85 + (i % 2) * 14;
-    adopt(suns[i], central);
-    setOrbit(suns[i], r, SPEED_K.core, ((i - 1) % 4) * (Math.PI / 2) + ring * 0.45 + rand01(suns[i].seed) * 0.3);
+  // core layout: 'orbit' (core folders ride the outer ring, as before), 'center' (the
+  // biggest core sits at the center like the original galaxy, the others orbit it)
+  // or 'fixed' (same, but the other cores stay put instead of orbiting)
+  const layout = settings.coreLayout === 'center' || settings.coreLayout === 'fixed' ? settings.coreLayout : 'orbit';
+  const frozen = layout === 'fixed';
+  let central;
+  if (suns.length === 0) {
+    if (layout !== 'orbit' && topFolderCores.length) {
+      central = topFolderCores[0]; // the biggest core folder takes the center
+      central.parent = null; central.orbitR = 0; central.omega = 0;
+    } else {
+      // no core at all: an invisible center point holds the galaxy together
+      central = {
+        path: ' center', tier: 'other', label: '', seed: hash32('center'),
+        wdeg: 0, adj: new Map(), parent: null, children: [], isAnchor: true, isCenter: true,
+        orbitR: 0, omega: 0, phase: 0, theta: 0, x: 0, y: 0, drawR: 0, z0: 0, pf: 1, depth: 0,
+        ox: 0, oy: 0, vx: 0, vy: 0, nx: 0, ny: 0, fx: 0, fy: 0,
+      };
+      nodes.set(central.path, central);
+    }
+  } else {
+    suns.sort((a, b) => b.wdeg - a.wdeg);
+    central = suns[0];
+    central.parent = null; central.orbitR = 0; central.omega = 0;
+    for (let i = 1; i < suns.length; i++) {
+      const ring = Math.floor((i - 1) / 4);
+      const r = 115 + ring * 85 + (i % 2) * 14;
+      adopt(suns[i], central);
+      setOrbit(suns[i], r, SPEED_K.core, ((i - 1) % 4) * (Math.PI / 2) + ring * 0.45 + rand01(suns[i].seed) * 0.3);
+      if (frozen) suns[i].omega = 0;
+    }
+  }
+  if (layout !== 'orbit') {
+    // the other top-level core folders join the sun system: rings of 5, 8, 11...
+    let k = 0, cap = 5, used = 0;
+    for (const f of topFolderCores) {
+      if (f === central) continue;
+      if (used >= cap) { k++; used = 0; cap = 5 + 3 * k; }
+      adopt(f, central);
+      setOrbit(f, 230 + k * 150, SPEED_K.core, (used / cap) * 2 * Math.PI + k * 0.5 + rand01(f.seed) * 0.2);
+      if (frozen) f.omega = 0;
+      used++;
+    }
   }
   const sunSet = new Set(suns.map((s) => s.path));
 
   // --- hubs: rule-matched, else auto-detect the next most-linked notes
   let hubs = [...nodes.values()].filter((n) => n.tier === 'hub');
   if (hubs.length === 0) {
-    hubs = ranked.filter((n) => !sunSet.has(n.path) && n.wdeg >= 4).slice(0, 8);
+    hubs = rankedAuto.filter((n) => !sunSet.has(n.path) && n.wdeg >= 4).slice(0, autoHub);
     hubs.forEach((n) => { n.tier = 'hub'; });
   }
   const hubKids = new Map(); // sun path -> [{hub, w}]
@@ -277,12 +412,16 @@ function buildModel(app, settings) {
     });
   }
   const hubSet = new Set(hubs.map((h) => h.path));
+  for (const fn of folderNodes.values()) {
+    if (fn.coreFolder) sunSet.add(fn.path); // rendered like a sun (not a link-parent: suns[] is untouched)
+    if (fn.hubFolder) hubSet.add(fn.path);  // rendered like a hub
+  }
 
   // --- category anchors (invisible) for satellite clusters, on an outer ring
   //     (expand mode only; galaxy mode spreads unlinked notes into the disc)
   const anchors = new Map(); // group tier -> anchor node
   const present = mode === 'expand'
-    ? [...keptGroups, 'other'].filter((t) => [...nodes.values()].some((n) => n.tier === t && !n.isAnchor))
+    ? (showFolders ? ['other'] : [...keptGroups, 'other']).filter((t) => [...nodes.values()].some((n) => n.tier === t && !n.isAnchor))
     : [];
   present.forEach((t, i) => {
     const a = {
@@ -300,6 +439,33 @@ function buildModel(app, settings) {
     nodes.set(a.path, a);
   });
 
+  // --- folder placement (nodes were created earlier, before the core is chosen).
+  //     Top-level folders orbit the core on an outer ring, subfolders orbit
+  //     their parent folder. Notes with no link-parent (below) orbit their own
+  //     folder. Tree lines are added after placement.
+  if (showFolders) {
+    const byParent = new Map(); // parent folder path ('' = root) -> [folder nodes]
+    for (const fn of folderNodes.values()) {
+      const pp = folderOf(fn.folderPath);
+      if (!byParent.has(pp)) byParent.set(pp, []);
+      byParent.get(pp).push(fn);
+    }
+    for (const [pp, list] of byParent) {
+      list.sort((a, b) => (a.folderPath < b.folderPath ? -1 : 1));
+      list.forEach((fn, i) => {
+        if (pp === '') {
+          if (fn === central || fn.parent) return; // already placed as a core (centered layout)
+          adopt(fn, central);
+          setOrbit(fn, (470 + (i % 3) * 85) * (settings.folderSpread || 1), SPEED_K.folder,
+            (i / list.length) * 2 * Math.PI + rand01(fn.seed) * 0.4);
+        } else {
+          adopt(fn, folderNodes.get(pp));
+          setOrbit(fn, (90 + 55 * i) * (settings.folderSpread || 1), SPEED_K.folder, i * GOLDEN + rand01(fn.seed) * 0.5);
+        }
+      });
+    }
+  }
+
   // --- everything else: orbit best-linked hub, else best-linked sun, else the
   //     group anchor (expand) or the spiral disc (galaxy).
   //     Links are gravity for the rank-and-file too: an ordinary note's orbit
@@ -309,7 +475,7 @@ function buildModel(app, settings) {
   //     drives it; the hash still sets the angle and jitter.
   let ordMax = 1;
   for (const n of nodes.values()) {
-    if (n.isAnchor || sunSet.has(n.path) || hubSet.has(n.path) || n.tier === 'archive') continue;
+    if (n.isAnchor || n.isFolder || sunSet.has(n.path) || hubSet.has(n.path) || n.tier === 'archive') continue;
     if (n.wdeg > ordMax) ordMax = n.wdeg;
   }
   const degLogMax = Math.log(1 + ordMax);
@@ -331,7 +497,7 @@ function buildModel(app, settings) {
 
   const pending = []; // [node, parent, tight] — placed most-linked first
   for (const n of nodes.values()) {
-    if (n.parent || n === central || n.isAnchor) continue;
+    if (n.parent || n === central || n.isAnchor || n.isFolder) continue;
     if (n.tier === 'archive') {
       // archive override stands: rim debris regardless of links
       adopt(n, central);
@@ -342,7 +508,10 @@ function buildModel(app, settings) {
     if (asHubChild.bw > 0) { pending.push([n, asHubChild.best, false]); continue; }
     const asSunChild = bestParent(n, suns);
     if (asSunChild.bw > 0) { pending.push([n, asSunChild.best, true]); continue; }
-    if (mode === 'expand') {
+    const ownFolder = showFolders ? folderNodes.get(folderOf(n.path)) : null;
+    if (ownFolder) {
+      pending.push([n, ownFolder, false]);
+    } else if (mode === 'expand') {
       pending.push([n, anchors.get(n.tier) || anchors.get('other') || central, false]);
     } else {
       // galaxy disc: denser toward the center, seeded on spiral arms; linked
@@ -364,18 +533,37 @@ function buildModel(app, settings) {
   pending.sort((p, q) => q[0].wdeg - p[0].wdeg || (p[0].path < q[0].path ? -1 : 1));
   for (const [n, parent, tight] of pending) placeLeaf(n, parent, tight);
 
+  // --- folder tree lines: folder <-> note and folder <-> parent folder. Kept out
+  //     of wdeg on purpose (structure must not change which notes are suns).
+  if (showFolders) {
+    const link = (fn, other) => {
+      fn.adj.set(other.path, 1); other.adj.set(fn.path, 1);
+      edges.push({ a: fn.path, b: other.path, w: 1, folder: true });
+    };
+    for (const f of files) {
+      const fn = folderNodes.get(folderOf(f.path));
+      const n = nodes.get(f.path);
+      if (fn && n && !isArchive(f.path)) link(fn, n);
+    }
+    for (const fn of folderNodes.values()) {
+      const pn = folderNodes.get(folderOf(fn.folderPath));
+      if (pn) link(pn, fn);
+    }
+  }
+
   // --- draw radii: content-sized within strict tier bands. A fat note can
   //     never outgrow the tier above it (hierarchy beats content). Sizes are
   //     RANK-normalized within each tier: smallest file -> band min, largest
   //     -> band max, so every tier shows its full visual spread.
   const bandOf = (n) => {
+    if (n.isFolder) return n.coreFolder ? 'coreFolder' : n.hubFolder ? 'hubFolder' : 'folder';
     if (sunSet.has(n.path)) return 'sun';
     if (hubSet.has(n.path)) return 'hub';
     if (n.tier === 'archive') return 'archive';
     return 'note';
   };
-  const BANDS = { sun: [12, 26], hub: [5.5, 11], note: [1.6, 5.0], archive: [1.0, 2.2] };
-  const groups = { sun: [], hub: [], note: [], archive: [] };
+  const BANDS = { sun: [12, 26], coreFolder: [9, 18], hubFolder: [5.5, 11], hub: [5.5, 11], folder: [5.5, 9], note: [1.6, 5.0], archive: [1.0, 2.2] };
+  const groups = { sun: [], coreFolder: [], hubFolder: [], hub: [], folder: [], note: [], archive: [] };
   for (const n of nodes.values()) {
     if (n.isAnchor) { n.drawR = 0; continue; }
     groups[bandOf(n)].push(n);
@@ -412,7 +600,9 @@ function buildModel(app, settings) {
   // strong enough that a sun outweighs a hub at equal distance (~1.5-2.2x),
   // weak enough that a planet near its own hub faces THAT hub — size^2 let
   // the core drown out every hub and whole clusters faced the center.
-  const lights = [...suns, ...hubs];
+  const folderLights = [...nodes.values()].filter((n) => n.coreFolder || n.hubFolder)
+    .sort((a, b) => b.bytes - a.bytes).slice(0, 24); // cap: every planet sums over every light each frame
+  const lights = [...suns, ...hubs, ...folderLights];
   for (const l of lights) l.lum = Math.sqrt(l.drawR);
 
   // gravity is applied LIVE by the view each frame (r/g, omega*g^1.5), so the
@@ -460,6 +650,21 @@ class GalaxyView extends ItemView {
   getIcon() { return 'orbit'; }
 
   saveSettings() { this.plugin.saveSettings(); }
+
+  // color of one node: folders and their notes honour the per-folder override
+  nodeColor(n) {
+    if (n.isFolder) {
+      const ov = folderOverride(this.settings, n.folderPath);
+      if (ov) return ov;
+      if (this.settings.colors.folder) return this.settings.colors.folder;
+      return n.coreFolder ? TIERS.core.color : n.hubFolder ? TIERS.hub.color : TIERS.folder.color;
+    }
+    if (n.dir && n.tier !== 'core' && n.tier !== 'hub' && n.tier !== 'archive') {
+      const ov = folderOverride(this.settings, n.dir);
+      if (ov) return ov;
+    }
+    return this.colorOf(n.tier);
+  }
 
   colorOf(tier) {
     const s = this.settings.colors[tier];
@@ -518,7 +723,9 @@ class GalaxyView extends ItemView {
     this.registerDomEvent(this.btnFit, 'click', () => this.fitView());
     this.registerDomEvent(this.btnRebuild, 'click', () => { this.build(); new Notice('Galaxy rebuilt'); });
     this.registerDomEvent(this.btnGear, 'click', () => {
-      this.panelEl.classList.toggle('vg-open');
+      const wasOpen = this.panelEl.classList.contains('vg-open');
+      this.buildPanel(this.contentEl); // re-read settings (they may have changed in the settings tab)
+      if (!wasOpen) this.panelEl.classList.add('vg-open');
     });
 
     this.registerDomEvent(this.canvas, 'wheel', (e) => this.onWheel(e), { passive: false });
@@ -572,11 +779,23 @@ class GalaxyView extends ItemView {
     const panel = root.createDiv({ cls: 'vg-panel' });
     this.panelEl = panel;
 
+    this._secOpen = this._secOpen || { Folders: true, 'Core nodes': true };
+    let body = panel; // rows are added to the current section's body
     const section = (title) => {
-      panel.createEl('div', { cls: 'vg-sec', text: title });
+      const open = !!this._secOpen[title];
+      const hd = panel.createEl('div', { cls: 'vg-sec vg-sec-toggle', text: (open ? '▾ ' : '▸ ') + title });
+      body = panel.createDiv({ cls: 'vg-secbody' });
+      body.style.display = open ? '' : 'none';
+      const bodyRef = body;
+      this.registerDomEvent(hd, 'click', () => {
+        const nowOpen = bodyRef.style.display === 'none';
+        bodyRef.style.display = nowOpen ? '' : 'none';
+        hd.setText((nowOpen ? '▾ ' : '▸ ') + title);
+        this._secOpen[title] = nowOpen;
+      });
     };
     const slider = (label, min, max, step, get, onInput, rebuilds) => {
-      const row = panel.createDiv({ cls: 'vg-row' });
+      const row = body.createDiv({ cls: 'vg-row' });
       row.createEl('span', { text: label });
       const inp = row.createEl('input');
       inp.type = 'range'; inp.min = min; inp.max = max; inp.step = step; inp.value = get();
@@ -589,6 +808,61 @@ class GalaxyView extends ItemView {
     };
     const s = this.settings;
 
+    section('Folders');
+    {
+      const row = body.createDiv({ cls: 'vg-row' });
+      row.createEl('span', { text: 'folders as nodes' });
+      const inp = row.createEl('input');
+      inp.type = 'checkbox'; inp.checked = s.showFolders !== false;
+      this.registerDomEvent(inp, 'change', () => {
+        s.showFolders = inp.checked; this.saveSettings(); this.build();
+      });
+      this._foldersCheck = inp; // kept in sync by the settings tab
+    }
+    {
+      const row = body.createDiv({ cls: 'vg-row' });
+      row.createEl('span', { text: 'folders as core' });
+      const inp = row.createEl('input');
+      inp.type = 'checkbox'; inp.checked = !!s.folderAsCore;
+      this.registerDomEvent(inp, 'change', () => {
+        s.folderAsCore = inp.checked; this.saveSettings(); this.build();
+      });
+    }
+    {
+      const row = body.createDiv({ cls: 'vg-row' });
+      row.createEl('span', { text: 'subfolders as hubs' });
+      const inp = row.createEl('input');
+      inp.type = 'checkbox'; inp.checked = !!s.folderAsHub;
+      this.registerDomEvent(inp, 'change', () => {
+        s.folderAsHub = inp.checked; this.saveSettings(); this.build();
+      });
+    }
+    slider('folder size', 0.3, 3, 0.05, () => (s.folderSize === undefined ? 1 : s.folderSize), (v) => { s.folderSize = v; }, false);
+    slider('folder names threshold', 0, 20, 0.1, () => s.folderLabelZoom || 0, (v) => { s.folderLabelZoom = v; }, false);
+
+    section('Core nodes');
+    {
+      const row = body.createDiv({ cls: 'vg-row' });
+      row.createEl('span', { text: 'position' });
+      const sel = row.createEl('select');
+      for (const [val, name] of [['orbit', 'Orbiting'], ['center', 'Centered'], ['fixed', 'Centered, fixed']]) {
+        const opt = sel.createEl('option', { text: name });
+        opt.value = val;
+      }
+      sel.value = s.coreLayout || 'orbit';
+      this.registerDomEvent(sel, 'change', () => { s.coreLayout = sel.value; this.saveSettings(); this.build(); });
+    }
+    slider('auto core notes', 0, 10, 1, () => (s.autoCoreCount === undefined ? 5 : s.autoCoreCount), (v) => { s.autoCoreCount = v; }, true);
+    slider('auto hub notes', 0, 20, 1, () => (s.autoHubCount === undefined ? 8 : s.autoHubCount), (v) => { s.autoHubCount = v; }, true);
+    slider('core brightness', 0, 2.5, 0.05, () => (s.coreBrightness === undefined ? 1 : s.coreBrightness), (v) => { s.coreBrightness = v; }, false);
+    {
+      const row = body.createDiv({ cls: 'vg-row' });
+      row.createEl('span', { text: 'core center color' });
+      const inp = row.createEl('input');
+      inp.type = 'color'; inp.value = s.coreCenterColor || DEFAULT_SETTINGS.coreCenterColor;
+      this.registerDomEvent(inp, 'input', () => { s.coreCenterColor = inp.value; this.saveSettings(); });
+    }
+
     section('Forces');
     slider('gravity', 0.5, 1.8, 0.01, () => s.gravity, (v) => { s.gravity = v; }, false);
     slider('bounciness', 0, 1, 0.05, () => (s.bounciness === undefined ? 0.6 : s.bounciness), (v) => { s.bounciness = v; }, false);
@@ -597,7 +871,7 @@ class GalaxyView extends ItemView {
 
     section('Display');
     {
-      const row = panel.createDiv({ cls: 'vg-row' });
+      const row = body.createDiv({ cls: 'vg-row' });
       row.createEl('span', { text: 'node style' });
       const sel = row.createEl('select');
       for (const [val, name] of [['disc', 'Classic'], ['planet', 'Planets']]) {
@@ -612,7 +886,7 @@ class GalaxyView extends ItemView {
       this._styleSelect = sel; // kept in sync by the settings-tab dropdown
     }
     {
-      const row = panel.createDiv({ cls: 'vg-row' });
+      const row = body.createDiv({ cls: 'vg-row' });
       row.createEl('span', { text: 'core names always on' });
       const inp = row.createEl('input');
       inp.type = 'checkbox'; inp.checked = s.sunLabels;
@@ -622,7 +896,7 @@ class GalaxyView extends ItemView {
     slider('label threshold', 0.3, 3, 0.05, () => s.labelZoom, (v) => { s.labelZoom = v; }, false);
     slider('glow', 0, 2, 0.05, () => s.glow, (v) => { s.glow = v; }, false);
     {
-      const row = panel.createDiv({ cls: 'vg-row' });
+      const row = body.createDiv({ cls: 'vg-row' });
       row.createEl('span', { text: 'corona' });
       const inp = row.createEl('input');
       inp.type = 'checkbox'; inp.checked = !!s.corona;
@@ -637,9 +911,9 @@ class GalaxyView extends ItemView {
     section('Colors');
     const colorKeys = ['core', 'hub',
       ...(this.model ? [...this.model.groupColors.keys()].sort() : []),
-      'other', 'archive'];
+      'other', 'archive', 'folder'];
     for (const tier of colorKeys) {
-      const row = panel.createDiv({ cls: 'vg-row' });
+      const row = body.createDiv({ cls: 'vg-row' });
       row.createEl('span', {
         text: tier.startsWith('g:') ? tier.slice(2).split('/').pop() : TIERS[tier].label,
       });
@@ -651,11 +925,37 @@ class GalaxyView extends ItemView {
       });
     }
 
+    section('Folder colors');
+    for (const d of listVaultFolders(this.app)) {
+      const depth = d.split('/').length - 1;
+      const row = body.createDiv({ cls: 'vg-row' });
+      const lab = row.createEl('span', { text: d.split('/').pop() });
+      lab.style.paddingLeft = (depth * 10) + 'px';
+      lab.title = d;
+      const inp = row.createEl('input');
+      inp.type = 'color';
+      inp.value = folderOverride(s, d) || this.colorOf('folder');
+      this.registerDomEvent(inp, 'input', () => {
+        s.folderColors = s.folderColors || {};
+        s.folderColors[d] = inp.value;
+        this.saveSettings();
+      });
+      const x = row.createEl('button', { text: '↺' });
+      x.title = 'remove this folder\'s color';
+      this.registerDomEvent(x, 'click', () => {
+        if (s.folderColors) delete s.folderColors[d];
+        this.saveSettings();
+        inp.value = folderOverride(s, d) || this.colorOf('folder');
+      });
+    }
+
     const reset = panel.createEl('button', { cls: 'vg-reset', text: 'reset to defaults' });
     this.registerDomEvent(reset, 'click', () => {
       const keepRules = {
         coreRules: s.coreRules, hubRules: s.hubRules,
         archiveFolders: s.archiveFolders, folderGroups: s.folderGroups,
+        excludeRules: s.excludeRules, autoCoreCount: s.autoCoreCount, autoHubCount: s.autoHubCount,
+        folderColors: s.folderColors,
       };
       this.plugin.settings = { ...DEFAULT_SETTINGS, colors: {}, ...keepRules };
       this.saveSettings();
@@ -673,12 +973,14 @@ class GalaxyView extends ItemView {
       this.model = buildModel(this.app, this.settings);
       this.order = [...this.model.nodes.values()];
       if (this.linkMode === 'auto' || this.linkMode === 'all' || this.linkMode === 'hover') {
-        const auto = this.model.edges.length > 2600 ? 'hover' : 'all';
+        const auto = this.model.edges.filter((e) => !e.folder).length > 2600 ? 'hover' : 'all';
         if (this.linkMode === 'auto') this.linkMode = auto;
         this.btnLinks.setText('links: ' + this.linkMode);
       }
-      const nNotes = [...this.model.nodes.values()].filter((n) => !n.isAnchor).length;
-      this.statusEl.setText(`${this.settings.mode} · ${nNotes} notes · ${this.model.edges.length} links · hover to inspect · click to open · drag to disturb`);
+      const nNotes = [...this.model.nodes.values()].filter((n) => !n.isAnchor && !n.isFolder).length;
+      const nFolders = [...this.model.nodes.values()].filter((n) => n.isFolder).length;
+      const nLinks = this.model.edges.filter((e) => !e.folder).length;
+      this.statusEl.setText(`${this.settings.mode} · ${nNotes} notes · ${nFolders ? nFolders + ' folders · ' : ''}${nLinks} links · hover to inspect · click to open · drag to disturb`);
       if (!this.stars) this.makeStars();
     } catch (e) {
       console.error('[vault-galaxy] build failed', e);
@@ -798,7 +1100,7 @@ class GalaxyView extends ItemView {
       const nd = this._nodeDrag;
       this._nodeDrag = null; // spring takes over from here
       this.canvas.style.cursor = 'pointer';
-      if (!nd.moved && !nd.node.isAnchor) {
+      if (!nd.moved && !nd.node.isAnchor && !nd.node.isFolder) {
         const file = this.app.vault.getAbstractFileByPath(nd.node.path);
         if (file instanceof TFile) this.app.workspace.getLeaf('tab').openFile(file);
       } else if (nd.moved) {
@@ -841,7 +1143,7 @@ class GalaxyView extends ItemView {
       if (n.isAnchor) continue;
       const dx = n.sx - mx, dy = n.sy - my;
       const d = Math.hypot(dx, dy);
-      const hitR = Math.max(7, n.drawR * this.settings.nodeSize * this.cam.scale * n.pf + 4);
+      const hitR = Math.max(7, n.drawR * this.settings.nodeSize * (n.isFolder ? (this.settings.folderSize || 1) : 1) * this.cam.scale * n.pf + 4);
       if (d < hitR && d < bd) { bd = d; best = n; }
     }
     if (best !== this.hover) {
@@ -1141,6 +1443,7 @@ class GalaxyView extends ItemView {
       ctx.strokeStyle = '#6f87c9';
       ctx.lineWidth = st.linkWidth;
       for (const e of m.edges) {
+        if (e.folder) continue;
         const a = m.nodes.get(e.a), b = m.nodes.get(e.b);
         if (!a || !b) continue;
         if (!onScreen(a, 60) && !onScreen(b, 60)) continue;
@@ -1149,6 +1452,25 @@ class GalaxyView extends ItemView {
           Math.min(0.16, 0.05 + e.w * 0.02) * (this.hoverSet ? 0.35 : 1) * modeDim * st.linkAlpha);
         ctx.beginPath(); ctx.moveTo(a.sx, a.sy); ctx.lineTo(b.sx, b.sy); ctx.stroke();
       }
+      ctx.globalAlpha = 1;
+    }
+    // folder tree lines: warm, separate from the blue link constellation. Drawn
+    // whatever the 'links' button says — they are structure, not link noise.
+    if (st.showFolders !== false) {
+      ctx.lineWidth = st.linkWidth * (st.folderLineWidth === undefined ? 1 : st.folderLineWidth);
+      ctx.globalAlpha = Math.min(0.9, 0.07 * st.linkAlpha * (st.folderLineAlpha === undefined ? 1 : st.folderLineAlpha) * (this.hoverSet ? 0.35 : 1));
+      const buckets = new Map(); // color -> Path2D (lines take the color of their folder)
+      for (const e of m.edges) {
+        if (!e.folder) continue;
+        const a = m.nodes.get(e.a), b = m.nodes.get(e.b);
+        if (!a || !b) continue;
+        if (!onScreen(a, 60) && !onScreen(b, 60)) continue;
+        const col = st.folderLineColor || this.nodeColor(a);
+        let path = buckets.get(col);
+        if (!path) { path = new Path2D(); buckets.set(col, path); }
+        path.moveTo(a.sx, a.sy); path.lineTo(b.sx, b.sy);
+      }
+      for (const [col, path] of buckets) { ctx.strokeStyle = col; ctx.stroke(path); }
       ctx.globalAlpha = 1;
     }
     if (this.hover) {
@@ -1173,6 +1495,9 @@ class GalaxyView extends ItemView {
     const ns = st.nodeStyle || 'disc';
     const coronaOn = !!st.corona;
     const coronaCs = st.coronaStrength === undefined ? 1 : st.coronaStrength;
+    // core brightness: glow/corona alpha and reach, and the body shade, of the suns only
+    const cb = Math.max(0, st.coreBrightness === undefined ? 1 : st.coreBrightness);
+    const cbReach = 0.7 + 0.3 * cb;
 
     // glow pass (additive)
     if (st.glow > 0) {
@@ -1184,7 +1509,7 @@ class GalaxyView extends ItemView {
         // planets view: only the stars (suns + hubs) are emitters — planets
         // are lit bodies and get no glow halo (their sprite's baked atmosphere
         // rim stays). Classic view keeps glow on everything, as always.
-        if (!isSun && !isHub && (ns === 'planet' || scale < 0.2)) continue; // also skip tiny glows when far out
+        if (!isSun && !isHub && !n.isFolder && (ns === 'planet' || scale < 0.2)) continue; // also skip tiny glows when far out
         // pf is the perspective factor (1 in flat view): near nodes render
         // larger and brighter, far ones smaller and dimmer
         const dim = (this.hoverSet && !this.hoverSet.has(n.path) ? 0.35 : 1) *
@@ -1203,15 +1528,15 @@ class GalaxyView extends ItemView {
           // sqrt(glow) instead of glow: their bodies are too small to stay
           // visible if a low glow setting crushes both reach AND alpha (suns
           // survive on sheer size; hubs vanished).
-          const br = (isSun ? n.drawR : Math.max(n.drawR, 8)) * st.nodeSize * scale * pulse * n.pf;
-          const cr = Math.min(320, br * (isSun ? 5.2 : 5.6) * glowSize * coronaCs);
-          ctx.globalAlpha = (isSun ? 0.95 * Math.min(1, st.glow) : 0.9 * Math.min(1, glowSize)) * dim;
-          ctx.drawImage(this.coronaSprite(this.colorOf(n.tier), isSun ? 'sun' : 'hub'), n.sx - cr, n.sy - cr, cr * 2, cr * 2);
+          const br = (isSun ? n.drawR : Math.max(n.drawR, 8)) * st.nodeSize * (n.isFolder ? (st.folderSize || 1) : 1) * scale * pulse * n.pf;
+          const cr = Math.min(320, br * (isSun ? 5.2 : 5.6) * glowSize * coronaCs * (isSun ? cbReach : 1));
+          ctx.globalAlpha = Math.min(1, (isSun ? 0.95 * Math.min(1, st.glow) * cb : 0.9 * Math.min(1, glowSize)) * dim);
+          ctx.drawImage(this.coronaSprite(this.nodeColor(n), isSun ? 'sun' : 'hub'), n.sx - cr, n.sy - cr, cr * 2, cr * 2);
           continue;
         }
-        const gs = n.drawR * st.nodeSize * (isSun ? 5.5 : isHub ? 4.2 : 3) * scale * pulse * glowSize * n.pf;
-        const spr = this.glow(this.colorOf(n.tier), Math.min(160, gs));
-        ctx.globalAlpha = (isSun ? 0.95 : isHub ? 0.8 : 0.5) * dim * Math.min(1, st.glow);
+        const gs = n.drawR * st.nodeSize * (n.isFolder ? (st.folderSize || 1) : 1) * (isSun ? 5.5 * cbReach : isHub ? 4.2 : 3) * scale * pulse * glowSize * n.pf;
+        const spr = this.glow(this.nodeColor(n), Math.min(160, gs));
+        ctx.globalAlpha = Math.min(1, (isSun ? 0.95 * cb : isHub ? 0.8 : 0.5) * dim * Math.min(1, st.glow));
         ctx.drawImage(spr, n.sx - gs, n.sy - gs, gs * 2, gs * 2);
       }
       ctx.globalCompositeOperation = 'source-over';
@@ -1225,9 +1550,9 @@ class GalaxyView extends ItemView {
       const dim = (this.hoverSet && !this.hoverSet.has(n.path) ? 0.3 : 1) *
         Math.max(0.45, Math.min(1, 1 + (n.pf - 1) * 1.6));
       const pulse = isSun ? 1 + 0.04 * Math.sin(this.T * 0.9 + n.seed % 7) : 1;
-      const r = Math.max(0.7, n.drawR * st.nodeSize * scale * pulse * n.pf);
+      const r = Math.max(0.7, n.drawR * st.nodeSize * (n.isFolder ? (st.folderSize || 1) : 1) * scale * pulse * n.pf);
       ctx.globalAlpha = dim;
-      if (ns === 'planet' && !isSun && !m.hubSet.has(n.path)) {
+      if (ns === 'planet' && !isSun && !n.isFolder && !m.hubSet.has(n.path)) {
         // multi-source lighting: every sun and hub pulls the lit side toward
         // itself, weighted by luminosity (sqrt of size, baked as .lum at
         // build) over distance squared. Why so flat: size^2 luminosity let
@@ -1253,7 +1578,7 @@ class GalaxyView extends ItemView {
             ? (PLANET_LIGHT.CRISP - dirness) / (PLANET_LIGHT.CRISP - PLANET_LIGHT.SOFT)
             : 1 + (PLANET_LIGHT.SOFT - dirness) / PLANET_LIGHT.SOFT);
         const li = Math.floor(lvl);
-        const col = this.colorOf(n.tier);
+        const col = this.nodeColor(n);
         const pr = r * 1.25; // sprite reaches past the body for the halo
         ctx.save();
         ctx.translate(n.sx, n.sy);
@@ -1265,10 +1590,21 @@ class GalaxyView extends ItemView {
         }
         ctx.restore();
       } else {
-        ctx.fillStyle = this.colorOf(n.tier);
+        const bodyCol = this.nodeColor(n);
+        ctx.fillStyle = isSun && cb !== 1 && bodyCol[0] === '#'
+          ? tint(bodyCol, cb < 1 ? cb - 1 : Math.min(0.6, (cb - 1) * 0.45)) : bodyCol;
         ctx.beginPath(); ctx.arc(n.sx, n.sy, r, 0, 6.2832); ctx.fill();
+        if (n.isFolder && !n.coreFolder && !n.hubFolder) { // folder: filled disc with a darker core and an outer ring
+          ctx.fillStyle = '#04050d';
+          ctx.beginPath(); ctx.arc(n.sx, n.sy, r * 0.5, 0, 6.2832); ctx.fill();
+          if (st.folderRing !== false) {
+            ctx.strokeStyle = this.nodeColor(n);
+            ctx.lineWidth = Math.max(1, r * 0.18);
+            ctx.beginPath(); ctx.arc(n.sx, n.sy, r * 1.35, 0, 6.2832); ctx.stroke();
+          }
+        }
         if (isSun) { // hot white center
-          ctx.fillStyle = '#fff7d8';
+          ctx.fillStyle = st.coreCenterColor || '#fff7d8';
           ctx.beginPath(); ctx.arc(n.sx, n.sy, r * 0.45, 0, 6.2832); ctx.fill();
         }
       }
@@ -1295,6 +1631,7 @@ class GalaxyView extends ItemView {
       }
     };
     const ls = scale / st.labelZoom; // label-gating zoom: threshold slider shifts when names appear
+    const fls = scale / (st.folderLabelZoom > 0 ? st.folderLabelZoom : st.labelZoom); // same, for folder names only
     for (const n of m.nodes.values()) {
       if (!onScreen(n, 40)) continue;
       const dimmed = this.hoverSet && !this.hoverSet.has(n.path);
@@ -1303,8 +1640,15 @@ class GalaxyView extends ItemView {
         if (ls > 0.25 && !this.hoverSet) label(n, 'italic 11px sans-serif', 0.28, 4);
         continue;
       }
-      const lr = n.drawR * st.nodeSize * scale * n.pf;
-      if (m.sunSet.has(n.path)) {
+      const lr = n.drawR * st.nodeSize * (n.isFolder ? (st.folderSize || 1) * (st.folderRing === false || n.coreFolder || n.hubFolder ? 1 : 1.35) : 1) * scale * n.pf;
+      if (n.isFolder) {
+        // structure labels: appear a little earlier than hubs
+        if (st.folderLabels !== false) {
+          const fs = st.folderLabelSize || 11;
+          const a = Math.min(0.85, Math.max(0, (fls - 0.12) * 2.6));
+          if ((a > 0.05 && !dimmed) || inHover) label(n, (n.coreFolder ? 'bold ' : 'italic ') + fs + 'px sans-serif', inHover ? 0.95 : a, lr + fs + 2);
+        }
+      } else if (m.sunSet.has(n.path)) {
         if (st.sunLabels) {
           if (!dimmed) label(n, 'bold 12px sans-serif', 0.9, lr + 14);
         } else { // zoom-gated like the rest of the galaxy
@@ -1328,7 +1672,7 @@ class GalaxyView extends ItemView {
       ctx.globalAlpha = 0.75;
       ctx.fillStyle = '#aebedd';
       ctx.textAlign = 'center';
-      ctx.fillText(this.hover.path, this.w / 2, this.h - 10);
+      ctx.fillText(this.hover.isFolder ? this.hover.folderPath + '/' : this.hover.path, this.w / 2, this.h - 10);
       ctx.globalAlpha = 1;
     }
   }
@@ -1340,108 +1684,153 @@ class GalaxySettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this._open = { folders: true, core: true }; // which sections are expanded (kept across re-renders)
   }
 
   display() {
     const { containerEl } = this;
     containerEl.empty();
+    containerEl.addClass('vgf-tab');
 
+    const plugin = this.plugin;
+    const S = new Proxy({}, { // always the CURRENT settings object, even if the panel's reset replaced it
+      get: (_, k) => plugin.settings[k],
+      set: (_, k, v) => { plugin.settings[k] = v; return true; },
+    });
+    const save = async () => { await plugin.saveSettings(); };
     const rebuildViews = () => {
       for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
         if (leaf.view && leaf.view.build) { leaf.view.build(); leaf.view.buildPanel(leaf.view.contentEl); }
       }
     };
-    const textRule = (name, desc, key, placeholder) => {
-      new Setting(containerEl)
-        .setName(name)
-        .setDesc(desc)
-        .addTextArea((ta) => {
-          ta.setPlaceholder(placeholder)
-            .setValue(this.plugin.settings[key])
-            .onChange(async (v) => {
-              this.plugin.settings[key] = v;
-              await this.plugin.saveSettings();
-              rebuildViews();
-            });
-          ta.inputEl.rows = 3;
-        });
+
+    // ---- small builders: every control writes straight to the settings and applies live
+    const section = (key, title, hint, parent) => {
+      const d = (parent || containerEl).createEl('details', { cls: 'vgf-details' });
+      d.open = !!this._open[key];
+      d.addEventListener('toggle', () => { this._open[key] = d.open; });
+      d.createEl('summary', { text: title });
+      const body = d.createDiv({ cls: 'vgf-body' });
+      if (hint) body.createEl('p', { text: hint, cls: 'setting-item-description' });
+      return body;
     };
-
-    new Setting(containerEl).setName('Vault structure').setHeading();
-    containerEl.createEl('p', {
-      text: 'All fields optional — leave them empty and the galaxy auto-detects: ' +
-        'your 5 most-linked notes become suns, the next most-linked become hubs, ' +
-        'and top-level folders become colored groups. Patterns are vault paths, ' +
-        'one per line, * matches anything.',
-      cls: 'setting-item-description',
-    });
-
-    textRule('Core notes (suns)',
-      'Notes that anchor the center of the galaxy. Example: notes/index.md or MOCs/*',
-      'coreRules', 'MOCs/*\nhome.md');
-    textRule('Hub notes (orange stars)',
-      'Router/index notes that orbit the suns and collect their own moons.',
-      'hubRules', 'MOCs/sub-*');
-    textRule('Archive folders',
-      'Folders rendered as dim debris at the galaxy rim.',
-      'archiveFolders', 'archive');
-    textRule('Folder groups (colored clusters)',
-      'Folders that get their own color (and their own satellite cluster in expand mode). Empty = every top-level folder automatically.',
-      'folderGroups', 'Projects\nAreas\nResources');
-
-    new Setting(containerEl).setName('Display').setHeading();
-    new Setting(containerEl)
-      .setName('Node style')
-      .setDesc('Classic draws every note as a glowing disc. Planets keeps the suns and hubs classic and renders every smaller note as a shaded planet lit by the galaxy core.')
-      .addDropdown((d) => d
-        .addOption('disc', 'Classic')
-        .addOption('planet', 'Planets')
-        .setValue(this.plugin.settings.nodeStyle || 'disc')
-        .onChange(async (v) => {
-          this.plugin.settings.nodeStyle = v;
-          await this.plugin.saveSettings();
-          // keep the on-canvas panel's copy of this control in step
-          for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-            if (leaf.view && leaf.view._styleSelect) leaf.view._styleSelect.value = v;
-          }
-        }));
-    new Setting(containerEl)
-      .setName('Corona')
-      .setDesc('Flare the suns and hubs with a layered bloom and ray spikes in their own color. Rides on top of the glow setting; suns burn brighter than hubs.')
-      .addToggle((t) => t
-        .setValue(!!this.plugin.settings.corona)
-        .onChange(async (v) => {
-          this.plugin.settings.corona = v;
-          await this.plugin.saveSettings();
-          for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-            if (leaf.view && leaf.view._coronaCheck) leaf.view._coronaCheck.checked = v;
-          }
-        }));
-    new Setting(containerEl)
-      .setName('Corona strength')
-      .setDesc('How far the corona reaches.')
-      .addSlider((sl) => sl
-        .setLimits(0.2, 2.5, 0.05)
-        .setValue(this.plugin.settings.coronaStrength === undefined ? 1 : this.plugin.settings.coronaStrength)
+    const toggle = (parent, name, desc, key, dflt, rebuild) => new Setting(parent).setName(name).setDesc(desc)
+      .addToggle((t) => t.setValue(S[key] === undefined ? dflt : !!S[key])
+        .onChange(async (v) => { S[key] = v; await save(); if (rebuild) rebuildViews(); }));
+    const slider = (parent, name, desc, key, min, max, step, dflt, rebuild) => new Setting(parent).setName(name).setDesc(desc)
+      .addSlider((sl) => sl.setLimits(min, max, step)
+        .setValue(S[key] === undefined ? dflt : S[key])
         .setDynamicTooltip()
-        .onChange(async (v) => {
-          this.plugin.settings.coronaStrength = v;
-          await this.plugin.saveSettings();
-          for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE)) {
-            if (leaf.view && leaf.view._coronaSlider) leaf.view._coronaSlider.value = v;
-          }
-        }));
+        .onChange(async (v) => { S[key] = v; await save(); if (rebuild) rebuildViews(); }));
+    const dropdown = (parent, name, desc, key, options, dflt, rebuild) => new Setting(parent).setName(name).setDesc(desc)
+      .addDropdown((d) => {
+        for (const [val, label] of options) d.addOption(val, label);
+        d.setValue(S[key] || dflt).onChange(async (v) => { S[key] = v; await save(); if (rebuild) rebuildViews(); });
+      });
+    const textRule = (parent, name, desc, key, placeholder) => new Setting(parent).setName(name).setDesc(desc)
+      .addTextArea((ta) => {
+        ta.setPlaceholder(placeholder).setValue(S[key] || '')
+          .onChange(async (v) => { S[key] = v; await save(); rebuildViews(); });
+        ta.inputEl.rows = 3;
+      });
 
-    new Setting(containerEl).setName('Tilted view').setHeading();
-    new Setting(containerEl)
-      .setName('Idle drift')
-      .setDesc('In the tilted views, slowly rotate the galaxy after a few hands-off seconds. Any interaction pauses it.')
-      .addToggle((t) => t
-        .setValue(this.plugin.settings.idleSpin)
-        .onChange(async (v) => {
-          this.plugin.settings.idleSpin = v;
-          await this.plugin.saveSettings();
-        }));
+    // ================= 1. Folders =================
+    const fol = section('folders', 'Folders', 'Show your folders as nodes, and choose how they look.');
+    toggle(fol, 'Folders as nodes', 'Every folder becomes a node linked to its notes and to its parent folder.', 'showFolders', true, true);
+    toggle(fol, 'Folders as core notes', 'Draw folders like core notes: big suns with a corona that light the notes around them.', 'folderAsCore', false, true);
+    toggle(fol, 'Subfolders as hub notes', 'Draw subfolders (every level below the top) like hub notes: orange stars with a corona.', 'folderAsHub', false, true);
+    slider(fol, 'Folder size', 'Size of the folder nodes (1 = default).', 'folderSize', 0.3, 3, 0.05, 1, false);
+    new Setting(fol).setName('Folder color').setDesc('Default color of the folder nodes. Individual folders can override it in "Folder colors" below.')
+      .addColorPicker((cp) => cp.setValue((S.colors && S.colors.folder) || TIERS.folder.color)
+        .onChange(async (v) => { S.colors = S.colors || {}; S.colors.folder = v; await save(); }))
+      .addExtraButton((b) => b.setIcon('rotate-ccw').setTooltip('Back to default')
+        .onClick(async () => { if (S.colors) delete S.colors.folder; await save(); this.display(); }));
+    slider(fol, 'Folder name threshold', 'How far you must zoom before folder names appear. Higher = names stay hidden until you are closer (up to 20). 0 = same as the general label threshold.', 'folderLabelZoom', 0, 20, 0.1, 0, false);
+
+    const more = section('foldersMore', 'More folder options', '', fol);
+    dropdown(more, 'Which folders are core', 'When "Folders as core notes" is on: top-level folders only, or every folder.', 'folderCoreLevel',
+      [['top', 'Top-level folders only'], ['all', 'All folders']], 'top', true);
+    toggle(more, 'Ring around folders', 'Draw an outer ring on plain folder nodes so they stand out from notes.', 'folderRing', true, false);
+    toggle(more, 'Folder names', 'Show folder names on the graph.', 'folderLabels', true, false);
+    slider(more, 'Folder name size', 'Font size of folder names, in pixels.', 'folderLabelSize', 8, 24, 1, 11, false);
+    new Setting(more).setName('Folder line color').setDesc('Lines linking folders to their notes. Reset = each line takes its folder\'s color.')
+      .addColorPicker((cp) => cp.setValue(S.folderLineColor || (S.colors && S.colors.folder) || TIERS.folder.color)
+        .onChange(async (v) => { S.folderLineColor = v; await save(); }))
+      .addExtraButton((b) => b.setIcon('rotate-ccw').setTooltip('Use each folder\'s color')
+        .onClick(async () => { S.folderLineColor = ''; await save(); this.display(); }));
+    slider(more, 'Folder line thickness', 'Thickness of the folder lines.', 'folderLineWidth', 0.2, 4, 0.1, 1, false);
+    slider(more, 'Folder line brightness', 'Visibility of the folder lines.', 'folderLineAlpha', 0.2, 5, 0.1, 1, false);
+    slider(more, 'Folder distance', 'How far folders sit from the center and from their parent folder.', 'folderSpread', 0.5, 2, 0.05, 1, true);
+    new Setting(more).setName('Reset folder settings').setDesc('Sizes, rings, names and lines go back to default. Folder colors are kept.')
+      .addButton((b) => b.setButtonText('Reset').onClick(async () => {
+        for (const k of ['folderAsCore', 'folderAsHub', 'folderCoreLevel', 'folderSize', 'folderRing', 'folderLabels', 'folderLabelSize',
+          'folderLabelZoom', 'folderLineWidth', 'folderLineAlpha', 'folderLineColor', 'folderSpread']) S[k] = DEFAULT_SETTINGS[k];
+        if (S.colors) delete S.colors.folder;
+        await save(); this.display(); rebuildViews();
+      }));
+
+    // ================= 2. Core nodes =================
+    const core = section('core', 'Core nodes', 'The suns of the galaxy: which notes or folders are core, where they sit, how they shine.');
+    dropdown(core, 'Core position', 'Orbiting: core folders ride the outer ring. Centered: the biggest core sits in the middle like the original galaxy and the others orbit it. Centered and fixed: same, but nothing orbits.', 'coreLayout',
+      [['orbit', 'Orbiting (default)'], ['center', 'Centered'], ['fixed', 'Centered and fixed']], 'orbit', true);
+    slider(core, 'Automatic core notes', 'How many of your most-linked notes become suns when no Core rule matches. 0 = none.', 'autoCoreCount', 0, 10, 1, 5, true);
+    slider(core, 'Automatic hub notes', 'How many of the next most-linked notes become hubs when no Hub rule matches. 0 = none.', 'autoHubCount', 0, 20, 1, 8, true);
+    slider(core, 'Core brightness', 'Glow, corona and body brightness of core nodes only (1 = default).', 'coreBrightness', 0, 2.5, 0.05, 1, false);
+    new Setting(core).setName('Core center color').setDesc('Color of the hot center of core nodes.')
+      .addColorPicker((cp) => cp.setValue(S.coreCenterColor || DEFAULT_SETTINGS.coreCenterColor)
+        .onChange(async (v) => { S.coreCenterColor = v; await save(); }))
+      .addExtraButton((b) => b.setIcon('rotate-ccw').setTooltip('Back to default')
+        .onClick(async () => { S.coreCenterColor = DEFAULT_SETTINGS.coreCenterColor; await save(); this.display(); }));
+
+    // ================= 3. Folder colors =================
+    const fc = section('colors', 'Folder colors',
+      'Pick a color for any folder. It recolors the folder node and every note inside it (the planets); ' +
+      'subfolders inherit it unless they have their own. Core and hub notes keep their gold and orange.');
+    const folderList = listVaultFolders(this.app);
+    const listEl = fc.createDiv();
+    const defaultFolderColor = () => (S.colors && S.colors.folder) || TIERS.folder.color;
+    const renderFolderList = (filter) => {
+      listEl.empty();
+      const f = (filter || '').trim().toLowerCase();
+      for (const d of folderList) {
+        if (f && !d.toLowerCase().includes(f)) continue;
+        const depth = d.split('/').length - 1;
+        const row = new Setting(listEl)
+          .setName(d.split('/').pop())
+          .setDesc(depth ? d : '')
+          .addColorPicker((cp) => cp
+            .setValue(folderOverride(S, d) || defaultFolderColor())
+            .onChange(async (v) => { S.folderColors = S.folderColors || {}; S.folderColors[d] = v; await save(); }))
+          .addExtraButton((b) => b.setIcon('rotate-ccw').setTooltip('Remove this folder\'s color')
+            .onClick(async () => { if (S.folderColors) delete S.folderColors[d]; await save(); renderFolderList(filter); }));
+        if (row.settingEl) row.settingEl.style.paddingLeft = (depth * 20) + 'px';
+      }
+      if (!listEl.childElementCount) listEl.createEl('p', { text: 'No folder found.', cls: 'setting-item-description' });
+    };
+    new Setting(fc).setName('Find a folder')
+      .addText((t) => t.setPlaceholder('type to filter').onChange((v) => renderFolderList(v)))
+      .addButton((b) => b.setButtonText('Reset all folder colors').onClick(async () => {
+        S.folderColors = {}; await save(); renderFolderList('');
+      }));
+    renderFolderList('');
+
+    // ================= 4. Display =================
+    const dsp = section('display', 'Display');
+    dropdown(dsp, 'Node style', 'Classic draws every note as a glowing disc. Planets keeps suns and hubs classic and renders every smaller note as a shaded planet.', 'nodeStyle',
+      [['disc', 'Classic'], ['planet', 'Planets']], 'disc', false);
+    slider(dsp, 'Label threshold', 'How far you must zoom before note names appear. Lower = names appear sooner.', 'labelZoom', 0.3, 3, 0.05, 3, false);
+    toggle(dsp, 'Corona', 'Flare the suns and hubs with a layered bloom and ray spikes.', 'corona', true, false);
+    slider(dsp, 'Corona strength', 'How far the corona reaches.', 'coronaStrength', 0.2, 2.5, 0.05, 1, false);
+    toggle(dsp, 'Idle drift', 'In the tilted views, slowly rotate the galaxy after a few hands-off seconds.', 'idleSpin', true, false);
+
+    // ================= 5. Vault structure rules =================
+    const rules = section('rules', 'Vault structure rules',
+      'All optional. Patterns are vault paths, one per line, * matches anything. Leave Core and Hub empty to let the galaxy auto-detect them.');
+    textRule(rules, 'Core notes (suns)', 'Notes that anchor the center of the galaxy. Example: notes/index.md or MOCs/*', 'coreRules', 'MOCs/*\nhome.md');
+    textRule(rules, 'Hub notes (orange stars)', 'Router/index notes that orbit the suns and collect their own moons.', 'hubRules', 'MOCs/sub-*');
+    textRule(rules, 'Never core / hub (exclusions)', 'Notes matching these patterns are never promoted to core or hub automatically (explicit Core/Hub rules still apply).', 'excludeRules', 'Journal/*\nInbox');
+    textRule(rules, 'Archive folders', 'Folders rendered as dim debris at the galaxy rim.', 'archiveFolders', 'archive');
+    textRule(rules, 'Folder groups (colored clusters)', 'Folders that get their own color (and their own satellite cluster in expand mode). Empty = every top-level folder automatically.', 'folderGroups', 'Projects\nAreas\nResources');
   }
 }
 
@@ -1470,6 +1859,7 @@ class VaultGalaxyPlugin extends Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS, ...(this.data.settings || {}),
       colors: { ...((this.data.settings || {}).colors || {}) },
+      folderColors: { ...((this.data.settings || {}).folderColors || {}) },
     };
     // earlier builds stored the tilt as a boolean
     if (typeof this.settings.tilt === 'boolean') this.settings.tilt = this.settings.tilt ? 'tilt' : 'flat';

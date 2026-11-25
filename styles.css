@@ -2,7 +2,7 @@
 
 /* Both selectors out-specify Obsidian's default .view-content padding, so the
    canvas sits flush without !important. */
-.workspace-leaf-content[data-type='vault-galaxy-view'] .view-content,
+.workspace-leaf-content[data-type='vault-galaxy-folders-view'] .view-content,
 .view-content.vault-galaxy-root {
   padding: 0;
 }
@@ -132,4 +132,52 @@
   color: rgba(174, 190, 221, 0.55);
   pointer-events: none;
   z-index: 10;
+}
+
+/* per-folder color rows in the panel */
+.vg-row span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1;
+}
+
+.vg-row button {
+  background: none;
+  border: none;
+  box-shadow: none;
+  color: #7f93bd;
+  font-size: 12px;
+  padding: 0 2px;
+  cursor: pointer;
+}
+
+/* simplified settings page: collapsible sections */
+.vgf-tab .vgf-details {
+  border-bottom: 1px solid var(--background-modifier-border);
+  margin-bottom: 4px;
+}
+.vgf-tab .vgf-details > summary {
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 1.05em;
+  padding: 10px 0;
+}
+.vgf-tab .vgf-details .vgf-details {
+  margin-left: 12px;
+  border-bottom: none;
+}
+.vgf-tab .vgf-details .vgf-details > summary {
+  font-weight: 500;
+  font-size: 0.95em;
+  color: var(--text-muted);
+}
+
+/* collapsible sections in the galaxy panel */
+.vg-sec-toggle {
+  cursor: pointer;
+  user-select: none;
+}
+.vg-sec-toggle:hover {
+  color: #b9c8ea;
 }
